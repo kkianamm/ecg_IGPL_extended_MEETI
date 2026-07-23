@@ -1,0 +1,106 @@
+diff --git a/data_fix.py b/data_fix.py
+index eb331be..9503799 100644
+--- a/data_fix.py
++++ b/data_fix.py
+@@ -61,7 +61,7 @@ def _parse_list(val):
+         return [t.strip(" '\"[]") for t in val.split(",") if t.strip(" '\"[]")]
+ 
+ 
+-def resolve_targets(df: pd.DataFrame, classnames):
++def resolve_targets(df: pd.DataFrame, classnames, split=None):
+     aliases = _get_aliases(classnames)
+     token2idx = {tok: i for i, row in enumerate(aliases) for tok in row}
+     cols_lower = {c.lower(): c for c in df.columns}
+@@ -75,7 +75,9 @@ def resolve_targets(df: pd.DataFrame, classnames):
+     if all(c is not None for c in per_class_cols):
+         for i, col in enumerate(per_class_cols):
+             Y[:, i] = df[col].astype(float).values
+-        return _guard(Y, classnames, source=f"per-class columns {per_class_cols}")
++        # Columns were located by name, so an alias mismatch is impossible here.
++        return _guard(Y, classnames, source=f"per-class columns {per_class_cols}",
++                      split=split, matched_by_name=True)
+ 
+     # --- Path B: a single list-like column of codes/phrases ---
+     list_col = next((cols_lower[c] for c in
+@@ -88,7 +90,8 @@ def resolve_targets(df: pd.DataFrame, classnames):
+                 j = token2idx.get(str(it).strip().lower())
+                 if j is not None:
+                     Y[r, j] = 1.0
+-        return _guard(Y, classnames, source=f"list column '{list_col}'")
++        return _guard(Y, classnames, source=f"list column '{list_col}'",
++                      split=split, matched_by_name=False)
+ 
+     raise ValueError(
+         f"labels.csv has no per-class columns nor a list column matching the "
+@@ -96,16 +99,59 @@ def resolve_targets(df: pd.DataFrame, classnames):
+         f"Set LABEL_ALIASES in config_ipl.py to match your vocabulary.")
+ 
+ 
+-def _guard(Y, classnames, source):
++def _guard(Y, classnames, source, split=None, matched_by_name=False):
++    """Reject targets that are genuinely unusable; warn about merely sparse ones.
++
++    Two failures used to be conflated here:
++
++    * **Alias mismatch** -- the label vocabulary in labels.csv does not match
++      LABEL_ALIASES, so nothing is ever set and every AUROC comes back NaN.
++      This is the bug this module was written to catch, and it stays fatal.
++    * **Sparse-but-correct labels** -- the columns matched fine, a class just
++      has no positives in this split. Weak-labeled datasets (MEETI, via
++      `prepare_meeti.py`) hit this routinely: rare superclasses such as HYP can
++      be absent from a small val/test fold, and `--limit` smoke runs make it
++      likelier still. Aborting here would block a legitimate run.
++
++    When targets come from per-class columns matched *by name*, an alias
++    mismatch is impossible by construction, so zero counts can only be sparsity.
++    """
++    tag = f"[data_fix]{'' if split is None else ' ' + split + ':'}"
+     counts = Y.sum(0)
+-    if Y.sum() == 0 or (counts == 0).any():
++
++    if len(Y) == 0:
++        print(f"{tag} WARNING: split is empty (0 rows) -- skipping target check.")
++        return Y
++
++    if Y.sum() == 0:
++        if matched_by_name:
++            raise ValueError(
++                f"No positive labels at all in {split or 'this split'} from {source}. "
++                f"The columns were found by name, so this is not an alias problem -- "
++                f"labels.csv genuinely carries no positives. If you built it with "
++                f"`prepare_meeti.py --label-mode none`, the class columns are all "
++                f"zero by design: that mode is for contrastive fine-tuning "
++                f"(`finetune_clip.py --caption report`), not for supervised "
++                f"training. Re-run with `--label-mode rule` to weak-label the "
++                f"reports.")
+         raise ValueError(
+             f"Degenerate targets from {source}: per-class positive counts = "
+             f"{dict(zip(classnames, counts.tolist()))}. A zero count means the "
+             f"label vocabulary in labels.csv does not match LABEL_ALIASES. Fix "
+             f"the aliases before training (this is exactly what caused the NaN "
+             f"AUROC / 0.0 F1).")
+-    print(f"[data_fix] targets OK from {source}: "
++
++    empty = [c for c, n in zip(classnames, counts.tolist()) if n == 0]
++    if empty:
++        print(f"{tag} WARNING: no positives for {empty} in this split "
++              f"({dict(zip(classnames, counts.astype(int).tolist()))}). "
++              f"Per-class AUROC will be NaN for those classes and macro AUROC "
++              f"will be computed over the rest. Expected for weak-labeled or "
++              f"`--limit`-subset data; if you did NOT expect it, check "
++              f"LABEL_ALIASES against labels.csv.")
++        return Y
++
++    print(f"{tag} targets OK from {source}: "
+           f"{dict(zip(classnames, counts.astype(int).tolist()))}")
+     return Y
+ 
+@@ -123,6 +169,7 @@ def build_splits(labels_csv, image_dir, classnames, preprocess, id_col="ecg_id")
+         ds.image_dir = image_dir
+         ds.preprocess = preprocess
+         ds.ids = sub[id_col].tolist()
+-        ds.targets = torch.tensor(resolve_targets(sub, classnames), dtype=torch.float32)
++        ds.targets = torch.tensor(resolve_targets(sub, classnames, split=name),
++                                  dtype=torch.float32)
+         out[name] = ds
+     return out

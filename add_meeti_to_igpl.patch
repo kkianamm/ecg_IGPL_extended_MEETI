@@ -1,0 +1,819 @@
+diff --git a/README_MEETI.md b/README_MEETI.md
+new file mode 100644
+index 0000000..686e724
+--- /dev/null
++++ b/README_MEETI.md
+@@ -0,0 +1,163 @@
++# Adding the MEETI dataset
++
++This repo was built around **PTB-XL**. `prepare_meeti.py` lets you run the same
++pipeline — zero-shot, linear probe, contrastive fine-tuning — on
++**MEETI** (MIMIC-IV-Ext ECG-Text-Image, <https://zenodo.org/records/15893351>),
++without touching any of the evaluation/training scripts.
++
++The trick: the whole repo only ever reads two things — `WORK_DIR/labels.csv`
++(indexed by `ecg_id`, with `strat_fold`, `report`, `superclasses`, and one 0/1
++column per class in `config.CLASSES`) and `WORK_DIR/images/<ecg_id>.png`.
++`prepare_meeti.py` produces exactly those from MEETI, so `zero_shot_eval.py`,
++`extract_features.py`, `linear_probe.py`, and `finetune_clip.py` all work as-is.
++
++## How MEETI differs from PTB-XL (and how we bridge it)
++
++| | PTB-XL | MEETI | Bridge |
++|---|---|---|---|
++| Waveforms | WFDB signals | none in the Zenodo zip (`.mat` = features+text) | reuse MEETI's shipped PNGs |
++| Images | rendered by `ecg_to_image.py` | shipped as `.png` (12×1 leads) | copied/symlinked into `images/` |
++| Labels | SCP codes → 5 superclasses | free-text `report` only | **weak-labeled** from text (`meeti_labeling.py`) |
++| Split | official `strat_fold` | none | deterministic, **patient-disjoint** by `subject_id` |
++| Report language | often German | English (MIMIC) | use `--caption report` directly |
++
++Two consequences to keep in mind:
++
++- **Labels are weak supervision.** They come from regex keyword rules over the
++  report text, not curated annotations. Use MEETI numbers as indicative, and do
++  **not** compare them head-to-head with PTB-XL's curated-label numbers. The
++  rules live in `meeti_labeling.py` — read and edit them. Run
++  `python meeti_labeling.py` to see them fire on sample statements.
++- **MEETI PNGs are a different visual style** than this repo's renders. Fine for
++  MEETI-only experiments. If you want cross-dataset transfer with pixel-identical
++  inputs, render MEETI from the raw MIMIC-IV-ECG waveforms instead (see
++  `--render-from-wfdb`).
++
++## Download
++
++The 3.3 GB Zenodo package (~10k imaged records):
++
++```bash
++# from https://zenodo.org/records/15893351
++wget https://zenodo.org/records/15893351/files/MEETI.zip?download=1 -O MEETI.zip
++unzip MEETI.zip -d MEETI      # yields MEETI/pNNNN/pXXXXXXXX/sZZZ/<id>.{mat,png}
++```
++
++The full 784k-record dataset lives on Hugging Face
++(`PKUDigitalHealth/MEETI`) if you need scale.
++
++## Prepare
++
++Keep MEETI outputs separate from your PTB-XL run with `WORK_DIR`:
++
++```bash
++export WORK_DIR=./work_meeti
++
++python prepare_meeti.py --meeti-dir ./MEETI --limit 500   # smoke test first
++python prepare_meeti.py --meeti-dir ./MEETI               # full
++```
++
++This writes `./work_meeti/labels.csv` and fills `./work_meeti/images/`. It also
++prints the per-class positive counts and how many reports matched no superclass.
++
++**MEETI ships images for only ~10,000 of its 784,680 records.** The rest are
++text/feature-only. Because every script here is image-based, `prepare_meeti.py`
++**drops imageless records by default**, so `labels.csv` ends up with the ~10k
++imaged subset — exactly what you want for vision work. Two escape hatches:
++`--render-from-wfdb` renders more images from MIMIC-IV-ECG waveforms if you have
++them; `--keep-unimaged` keeps every row (but then you must filter to
++`has_image == 1` yourself before evaluating, or the loaders will crash on a
++missing PNG). If you already built a full-size `labels.csv`, run
++`python filter_imaged.py` to trim it in place without re-scanning.
++
++Useful flags:
++
++- `--label-mode none` — skip weak-labeling entirely (class columns all zero).
++  Use this when you only want **contrastive fine-tuning** on image↔report pairs.
++- `--caption-source {report,llm,report+llm}` — which text lands in the `report`
++  column that `finetune_clip.py --caption report` consumes. `report` = the
++  clinician text; `llm` = the richer GPT-4o interpretation. The clinician
++  `report_raw` and `llm_interpretation` are always kept as extra columns too.
++- `--image-mode symlink` — symlink PNGs instead of copying (saves disk).
++- `--render-from-wfdb /path/to/mimic-iv-ecg` — if you have the matching MIMIC
++  WFDB records, render missing images in the identical PTB-XL style via this
++  repo's own `ecg_to_image.py`.
++
++## Run the existing pipeline (unchanged)
++
++```bash
++export WORK_DIR=./work_meeti
++
++# Zero-shot BiomedCLIP, 5-class multi-label
++python zero_shot_eval.py
++
++# Linear probe on frozen features
++python extract_features.py && python linear_probe.py
++
++# Contrastive fine-tuning — MEETI's English reports make this the natural caption
++python finetune_clip.py --caption report
++python zero_shot_eval.py --ckpt work_meeti/checkpoints/biomedclip_ft.pt
++```
++
++> For MEETI, prefer `--caption report` over the default `--caption label`: the
++> reports are informative English, and records with no matched superclass would
++> otherwise produce an empty label caption.
++
++## Run the IPL / COMPOSE extensions on MEETI
++
++This fork adds prompt-learning (`train_ipl.py`, `eval_ipl.py`) and COMPOSE
++(`train_compose.py`) on top of the base pipeline. They read the same two things
++— `WORK_DIR/labels.csv` and `WORK_DIR/images/` — through `config_ipl.py`, which
++inherits `WORK_DIR` from `config.py`. So exporting `WORK_DIR` is all that is
++needed to point them at MEETI:
++
++```bash
++export WORK_DIR=./work_meeti
++
++python train_ipl.py --phase C            # instance-conditioned prompt learning
++python eval_ipl.py  --ckpt work_meeti/checkpoints/ipl_C_train_full.pt
++python train_compose.py                  # COMPOSE
++```
++
++`config_ipl.CLASSNAMES` are the same 5 superclasses, and `prepare_meeti.py`
++already writes one 0/1 column per class, so label resolution matches without
++touching `LABEL_ALIASES`.
++
++### Weak labels and the `data_fix.py` guard
++
++`data_fix.py` (used by `train_compose.py`) guards against a real bug: if the
++label vocabulary in `labels.csv` does not match `LABEL_ALIASES`, every target
++silently resolves to zero and every AUROC comes back NaN. Its original check
++aborted whenever **any** class had zero positives.
++
++That check is too strict for MEETI. Labels here are weak (regex over free text),
++so a rare superclass — HYP especially — can legitimately have no positives in a
++small val/test fold, and `--limit` smoke runs make it likelier still. The guard
++now separates the two cases:
++
++- **Fatal** — no positives anywhere *and* the class columns were not matched by
++  name. This is the alias mismatch the guard exists for; behaviour is unchanged.
++- **Fatal, with a MEETI-specific message** — all-zero targets when the columns
++  *were* matched by name. Usually means you built `labels.csv` with
++  `--label-mode none`, which is for contrastive fine-tuning, not supervised
++  training.
++- **Warning** — some classes have positives, others do not. Training proceeds;
++  per-class AUROC is NaN for the empty classes and macro AUROC averages the rest.
++
++Watch that warning: if a class is empty in your **test** fold, its AUROC is not
++meaningful and the macro number is not comparable to a PTB-XL run.
++
++## Files added
++
++- `prepare_meeti.py` — the adapter (discovery, `.mat` parsing, weak-labeling,
++  patient-disjoint split, image placement, `labels.csv` writer).
++- `meeti_labeling.py` — the transparent report → superclass keyword rules.
++- `filter_imaged.py` — trims an existing `labels.csv` to image-backed rows.
++- `README_MEETI.md` — this file.
++
++One existing file was modified: `data_fix.py`, so its all-zero-target guard
++distinguishes a genuine alias mismatch from legitimately sparse weak labels (see
++above). PTB-XL behaviour is unchanged — the alias-mismatch check still fires
++exactly as before. Nothing else was touched: `zero_shot_eval.py`,
++`extract_features.py`, `linear_probe.py`, `finetune_clip.py`, `train_ipl.py`,
++`eval_ipl.py` and `train_compose.py` are all byte-identical to upstream.
+diff --git a/data_fix.py b/data_fix.py
+index eb331be..9503799 100644
+--- a/data_fix.py
++++ b/data_fix.py
+@@ -61,7 +61,7 @@ def _parse_list(val):
+         return [t.strip(" '\"[]") for t in val.split(",") if t.strip(" '\"[]")]
+ 
+ 
+-def resolve_targets(df: pd.DataFrame, classnames):
++def resolve_targets(df: pd.DataFrame, classnames, split=None):
+     aliases = _get_aliases(classnames)
+     token2idx = {tok: i for i, row in enumerate(aliases) for tok in row}
+     cols_lower = {c.lower(): c for c in df.columns}
+@@ -75,7 +75,9 @@ def resolve_targets(df: pd.DataFrame, classnames):
+     if all(c is not None for c in per_class_cols):
+         for i, col in enumerate(per_class_cols):
+             Y[:, i] = df[col].astype(float).values
+-        return _guard(Y, classnames, source=f"per-class columns {per_class_cols}")
++        # Columns were located by name, so an alias mismatch is impossible here.
++        return _guard(Y, classnames, source=f"per-class columns {per_class_cols}",
++                      split=split, matched_by_name=True)
+ 
+     # --- Path B: a single list-like column of codes/phrases ---
+     list_col = next((cols_lower[c] for c in
+@@ -88,7 +90,8 @@ def resolve_targets(df: pd.DataFrame, classnames):
+                 j = token2idx.get(str(it).strip().lower())
+                 if j is not None:
+                     Y[r, j] = 1.0
+-        return _guard(Y, classnames, source=f"list column '{list_col}'")
++        return _guard(Y, classnames, source=f"list column '{list_col}'",
++                      split=split, matched_by_name=False)
+ 
+     raise ValueError(
+         f"labels.csv has no per-class columns nor a list column matching the "
+@@ -96,16 +99,59 @@ def resolve_targets(df: pd.DataFrame, classnames):
+         f"Set LABEL_ALIASES in config_ipl.py to match your vocabulary.")
+ 
+ 
+-def _guard(Y, classnames, source):
++def _guard(Y, classnames, source, split=None, matched_by_name=False):
++    """Reject targets that are genuinely unusable; warn about merely sparse ones.
++
++    Two failures used to be conflated here:
++
++    * **Alias mismatch** -- the label vocabulary in labels.csv does not match
++      LABEL_ALIASES, so nothing is ever set and every AUROC comes back NaN.
++      This is the bug this module was written to catch, and it stays fatal.
++    * **Sparse-but-correct labels** -- the columns matched fine, a class just
++      has no positives in this split. Weak-labeled datasets (MEETI, via
++      `prepare_meeti.py`) hit this routinely: rare superclasses such as HYP can
++      be absent from a small val/test fold, and `--limit` smoke runs make it
++      likelier still. Aborting here would block a legitimate run.
++
++    When targets come from per-class columns matched *by name*, an alias
++    mismatch is impossible by construction, so zero counts can only be sparsity.
++    """
++    tag = f"[data_fix]{'' if split is None else ' ' + split + ':'}"
+     counts = Y.sum(0)
+-    if Y.sum() == 0 or (counts == 0).any():
++
++    if len(Y) == 0:
++        print(f"{tag} WARNING: split is empty (0 rows) -- skipping target check.")
++        return Y
++
++    if Y.sum() == 0:
++        if matched_by_name:
++            raise ValueError(
++                f"No positive labels at all in {split or 'this split'} from {source}. "
++                f"The columns were found by name, so this is not an alias problem -- "
++                f"labels.csv genuinely carries no positives. If you built it with "
++                f"`prepare_meeti.py --label-mode none`, the class columns are all "
++                f"zero by design: that mode is for contrastive fine-tuning "
++                f"(`finetune_clip.py --caption report`), not for supervised "
++                f"training. Re-run with `--label-mode rule` to weak-label the "
++                f"reports.")
+         raise ValueError(
+             f"Degenerate targets from {source}: per-class positive counts = "
+             f"{dict(zip(classnames, counts.tolist()))}. A zero count means the "
+             f"label vocabulary in labels.csv does not match LABEL_ALIASES. Fix "
+             f"the aliases before training (this is exactly what caused the NaN "
+             f"AUROC / 0.0 F1).")
+-    print(f"[data_fix] targets OK from {source}: "
++
++    empty = [c for c, n in zip(classnames, counts.tolist()) if n == 0]
++    if empty:
++        print(f"{tag} WARNING: no positives for {empty} in this split "
++              f"({dict(zip(classnames, counts.astype(int).tolist()))}). "
++              f"Per-class AUROC will be NaN for those classes and macro AUROC "
++              f"will be computed over the rest. Expected for weak-labeled or "
++              f"`--limit`-subset data; if you did NOT expect it, check "
++              f"LABEL_ALIASES against labels.csv.")
++        return Y
++
++    print(f"{tag} targets OK from {source}: "
+           f"{dict(zip(classnames, counts.astype(int).tolist()))}")
+     return Y
+ 
+@@ -123,6 +169,7 @@ def build_splits(labels_csv, image_dir, classnames, preprocess, id_col="ecg_id")
+         ds.image_dir = image_dir
+         ds.preprocess = preprocess
+         ds.ids = sub[id_col].tolist()
+-        ds.targets = torch.tensor(resolve_targets(sub, classnames), dtype=torch.float32)
++        ds.targets = torch.tensor(resolve_targets(sub, classnames, split=name),
++                                  dtype=torch.float32)
+         out[name] = ds
+     return out
+diff --git a/filter_imaged.py b/filter_imaged.py
+new file mode 100644
+index 0000000..66e9da8
+--- /dev/null
++++ b/filter_imaged.py
+@@ -0,0 +1,19 @@
++# Run this from the repo root, with the same WORK_DIR you used:
++#     export WORK_DIR=./work_meeti
++#     python filter_imaged.py
++import os, pandas as pd, config as C
++
++path = os.path.join(C.WORK_DIR, "labels.csv")
++df = pd.read_csv(path, index_col="ecg_id")
++before = len(df)
++df = df[df["has_image"] == 1]
++df.to_csv(path)
++
++tr = df.strat_fold.isin(C.TRAIN_FOLDS).sum()
++va = (df.strat_fold == C.VAL_FOLD).sum()
++te = (df.strat_fold == C.TEST_FOLD).sum()
++print(f"{path}: {before} -> {len(df)} rows (image-backed only)")
++print(f"train {tr} | val {va} | test {te}")
++print("per-class positives:")
++for c in C.CLASSES:
++    print(f"  {c:5s}: {int(df[c].sum())}")
+diff --git a/meeti_labeling.py b/meeti_labeling.py
+new file mode 100644
+index 0000000..7afa108
+--- /dev/null
++++ b/meeti_labeling.py
+@@ -0,0 +1,139 @@
++"""
++Weak-label MEETI / MIMIC-IV-ECG free-text reports into the 5 PTB-XL diagnostic
++superclasses (NORM, MI, STTC, CD, HYP) used everywhere else in this repo.
++
++WHY THIS EXISTS
++---------------
++PTB-XL ships structured SCP codes that map cleanly to 5 superclasses. MEETI does
++*not*: it provides a free-text clinical `report` (from MIMIC-IV-ECG) plus a GPT-4o
++`LLM_Interpretation`, but no structured multi-label targets. To evaluate the same
++5-class task (zero-shot, linear probe) on MEETI, we derive those labels from the
++report text with the transparent keyword rules below.
++
++THIS IS WEAK SUPERVISION, NOT GROUND TRUTH.
++Regex keyword matching on cardiology free text is approximate: it will miss
++paraphrases and occasionally mislabel. Treat MEETI numbers derived this way as
++indicative, not directly comparable to PTB-XL's curated labels. The rules are
++deliberately kept here, in plain sight, so you can inspect and edit them.
++
++For pure contrastive fine-tuning (image<->report), you do NOT need these labels
++at all -- use `prepare_meeti.py --label-mode none`.
++
++Public API
++----------
++    map_report_to_superclasses(text) -> sorted list of superclass codes
++    label_matrix(text)               -> dict {code: 0/1} over config.CLASSES
++"""
++from __future__ import annotations
++
++import re
++from typing import Dict, List
++
++import config as C
++
++# ---------------------------------------------------------------------------
++# Keyword rules.  Each pattern is a case-insensitive regex searched in the
++# report text.  Edit freely -- add synonyms, tighten boundaries, etc.
++# ---------------------------------------------------------------------------
++ABNORMAL_PATTERNS: Dict[str, List[str]] = {
++    # Myocardial infarction / acute injury
++    "MI": [
++        r"myocardial infarction",
++        r"infarct",
++        r"\bstemi\b",
++        r"st[-\s]?elevation",
++        r"pathologic(?:al)? q[-\s]?wave",
++        r"\bq[-\s]?waves?\b",
++    ],
++    # ST/T changes, ischemia, repolarization abnormalities
++    "STTC": [
++        r"st[-\s]?depression",
++        r"st[-\s/]?t\b",
++        r"st[-\s]segment",
++        r"t[-\s]?wave (?:abnormalit|change|inversion|flatten)",
++        r"nonspecific|non[-\s]specific",
++        r"repolar",
++        r"ischemi|ischaemi",
++    ],
++    # Conduction disturbances / blocks / pre-excitation
++    "CD": [
++        r"\bblock\b",
++        r"bundle[-\s]?branch",
++        r"\blbbb\b|\brbbb\b|\bivcd\b|\blafb\b|\blpfb\b",
++        r"intraventricular conduction",
++        r"fascicular|hemiblock",
++        r"conduction (?:delay|disturbance|abnormalit)",
++        r"wolff[-\s]?parkinson|\bwpw\b|pre[-\s]?excitation",
++        r"(?:first|second|third)[-\s]degree",
++        r"\bav\b.{0,6}block|atrioventricular block",
++    ],
++    # Hypertrophy / chamber enlargement / atrial abnormality
++    "HYP": [
++        r"hypertroph",
++        r"\blvh\b|\brvh\b|\blae\b|\brae\b",
++        r"(?:ventricular|atrial) (?:hypertroph|enlargement|abnormalit)",
++        r"enlargement",
++        r"biatrial",
++    ],
++}
++
++# A record is called NORM only when a "normal" cue is present AND no abnormal
++# class fired (so "normal sinus rhythm with LBBB" -> CD, not NORM).
++NORMAL_PATTERNS: List[str] = [
++    r"normal ecg",
++    r"normal electrocardiogram",
++    r"normal tracing",
++    r"within normal limits",
++    r"otherwise normal",
++    r"normal sinus rhythm",
++]
++
++_ABNORMAL_COMPILED = {
++    cls: [re.compile(p, re.IGNORECASE) for p in pats]
++    for cls, pats in ABNORMAL_PATTERNS.items()
++}
++_NORMAL_COMPILED = [re.compile(p, re.IGNORECASE) for p in NORMAL_PATTERNS]
++
++
++def map_report_to_superclasses(text: str) -> List[str]:
++    """Return the sorted subset of config.CLASSES implied by ``text``.
++
++    Multi-label: several abnormal classes may fire. NORM is mutually exclusive
++    with the abnormal classes and only assigned as a fallback normal cue.
++    """
++    if not text:
++        return []
++    hits = set()
++    for cls, patterns in _ABNORMAL_COMPILED.items():
++        if cls not in C.CLASSES:
++            continue
++        if any(rx.search(text) for rx in patterns):
++            hits.add(cls)
++
++    if not hits and "NORM" in C.CLASSES:
++        if any(rx.search(text) for rx in _NORMAL_COMPILED):
++            hits.add("NORM")
++
++    return sorted(hits, key=C.CLASSES.index)
++
++
++def label_matrix(text: str) -> Dict[str, int]:
++    """Return a {class: 0/1} dict over config.CLASSES for one report string."""
++    active = set(map_report_to_superclasses(text))
++    return {c: int(c in active) for c in C.CLASSES}
++
++
++if __name__ == "__main__":
++    # Quick self-check on representative MIMIC-style statements.
++    samples = [
++        "Normal ECG. Normal sinus rhythm.",
++        "Normal sinus rhythm with left bundle branch block",
++        "Anteroseptal myocardial infarction, age undetermined",
++        "Nonspecific ST-T wave changes; consider ischemia",
++        "Left ventricular hypertrophy with repolarization abnormality",
++        "First degree AV block",
++        "Left atrial enlargement",
++        "Sinus bradycardia",  # -> no superclass (expected: empty)
++    ]
++    for s in samples:
++        print(f"{map_report_to_superclasses(s)!s:35s} <- {s}")
+diff --git a/prepare_meeti.py b/prepare_meeti.py
+new file mode 100644
+index 0000000..2ef811e
+--- /dev/null
++++ b/prepare_meeti.py
+@@ -0,0 +1,368 @@
++"""
++Adapt the MEETI dataset (MIMIC-IV-Ext ECG-Text-Image, https://zenodo.org/records/15893351)
++to the exact on-disk contract this repo already uses for PTB-XL, so that
++`zero_shot_eval.py`, `extract_features.py`, `linear_probe.py` and
++`finetune_clip.py` all run on MEETI *unchanged*.
++
++What the repo expects (the whole contract):
++  1. WORK_DIR/labels.csv   indexed by `ecg_id`, with columns:
++       strat_fold, report, superclasses (pipe-joined), and one 0/1 column per
++       class in config.CLASSES (NORM, MI, STTC, CD, HYP).
++  2. WORK_DIR/images/<ecg_id>.png   one rendered ECG image per record,
++       reachable via prepare_data.image_path_for(ecg_id).
++Downstream scripts only ever read those two things.
++
++Key differences from PTB-XL and how we bridge them:
++  * MEETI already ships plotted PNGs (12x1 leads) -> we reuse them directly
++    (copy or symlink) instead of rendering from a waveform. The Zenodo package
++    has no WFDB signals; if you separately have the MIMIC-IV-ECG waveforms you
++    can render in the identical PTB-XL style with --render-from-wfdb.
++  * MEETI has no structured labels -> we weak-label the free-text `report`
++    into the 5 superclasses (see meeti_labeling.py). Use --label-mode none to
++    skip this entirely (fine for contrastive fine-tuning on image<->report).
++  * MEETI has no fold column -> we build a deterministic, patient-disjoint
++    split by subject_id into folds 1..10 (train 1-8, val 9, test 10), matching
++    how the rest of the repo slices strat_fold.
++
++Typical use (keep MEETI separate from your PTB-XL run via WORK_DIR):
++
++    export WORK_DIR=./work_meeti
++    python prepare_meeti.py --meeti-dir /path/to/MEETI --limit 500   # smoke test
++    python prepare_meeti.py --meeti-dir /path/to/MEETI               # full
++
++    python zero_shot_eval.py                       # 5-class zero-shot on MEETI
++    python extract_features.py && python linear_probe.py
++    python finetune_clip.py --caption report       # MIMIC reports are English
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import os
++import shutil
++from pathlib import Path
++from typing import Dict, List, Optional, Tuple
++
++import numpy as np
++import pandas as pd
++from tqdm import tqdm
++
++import config as C
++from meeti_labeling import map_report_to_superclasses
++
++try:
++    # Reuse the exact image-path convention from the rest of the repo.
++    from prepare_data import image_path_for
++except Exception:  # noqa: BLE001 - wfdb (pulled in transitively) may be absent
++    def image_path_for(ecg_id):  # identical to prepare_data.image_path_for
++        return os.path.join(C.IMG_DIR, f"{int(ecg_id):05d}.png")
++
++
++# ---------------------------------------------------------------------------
++# .mat helpers -- MEETI stores id/report/LLM_Interpretation (and per-beat
++# features) inside a MATLAB .mat file; scipy returns nested numpy arrays.
++# ---------------------------------------------------------------------------
++def _flatten_to_str(value) -> str:
++    """Recursively join whatever scipy.io.loadmat returned into a plain string."""
++    if value is None:
++        return ""
++    if isinstance(value, str):
++        return value.strip()
++    if isinstance(value, bytes):
++        return value.decode("utf-8", "ignore").strip()
++    if isinstance(value, np.ndarray):
++        if value.dtype.kind in ("U", "S"):
++            return " ".join(str(x).strip() for x in value.ravel() if str(x).strip())
++        parts = [_flatten_to_str(v) for v in value.ravel()]
++        return " ".join(p for p in parts if p).strip()
++    if isinstance(value, (list, tuple)):
++        parts = [_flatten_to_str(v) for v in value]
++        return " ".join(p for p in parts if p).strip()
++    return str(value).strip()
++
++
++def read_mat_fields(mat_path: str, keys=("report", "LLM_Interpretation", "id")) -> Dict[str, str]:
++    """Return the requested string fields from a MEETI .mat file (best effort)."""
++    from scipy.io import loadmat  # imported lazily; scipy is already a dependency
++
++    data = loadmat(mat_path)
++    out: Dict[str, str] = {}
++    lower = {k.lower(): k for k in data.keys()}
++    for want in keys:
++        real = lower.get(want.lower())
++        out[want] = _flatten_to_str(data[real]) if real is not None else ""
++    return out
++
++
++# ---------------------------------------------------------------------------
++# Record discovery
++# ---------------------------------------------------------------------------
++def _study_id_from_stem(stem: str) -> Optional[int]:
++    """MEETI study files are named <study_id>.png/.mat; keep only int-castable stems."""
++    try:
++        return int(stem)
++    except ValueError:
++        return None
++
++
++def _subject_from_path(mat_path: Path) -> str:
++    """Extract subject id from .../pXXXX/pXXXXXXXX/sZZZ/ZZZ.mat -> 'pXXXXXXXX'."""
++    for part in mat_path.parts:
++        if part.startswith("p") and part[1:].isdigit() and len(part) > 5:
++            return part
++    # Fall back to the immediate grandparent directory name.
++    return mat_path.parent.parent.name
++
++
++def discover_records(meeti_dir: Path) -> List[Dict]:
++    """Return [{ecg_id, subject_id, mat, png}] by reading record_list.csv if
++    usable, otherwise by walking the directory tree for *.mat files."""
++    records: List[Dict] = []
++
++    record_list = meeti_dir / "record_list.csv"
++    used_csv = False
++    if record_list.exists():
++        try:
++            df = pd.read_csv(record_list)
++            cols = {c.lower(): c for c in df.columns}
++            path_col = cols.get("path") or cols.get("file_path")
++            name_col = cols.get("file_name") or cols.get("filename") or cols.get("record")
++            subj_col = cols.get("subject_id") or cols.get("subject")
++            if path_col or name_col:
++                for _, row in df.iterrows():
++                    rel = str(row[path_col]) if path_col else ""
++                    stem = str(row[name_col]) if name_col else Path(rel).stem
++                    stem = Path(stem).stem  # drop any extension
++                    ecg_id = _study_id_from_stem(stem)
++                    if ecg_id is None:
++                        continue
++                    base = (meeti_dir / rel) if rel else None
++                    # `rel` may point at the folder or at the file with/without ext.
++                    if base and base.suffix:
++                        base = base.with_suffix("")
++                    mat = _first_existing(
++                        base.with_suffix(".mat") if base else None,
++                        list(meeti_dir.rglob(f"{stem}.mat")),
++                    )
++                    if mat is None:
++                        continue
++                    png = mat.with_suffix(".png")
++                    subj = str(row[subj_col]) if subj_col else _subject_from_path(mat)
++                    records.append(
++                        {"ecg_id": ecg_id, "subject_id": subj,
++                         "mat": mat, "png": png if png.exists() else None}
++                    )
++                used_csv = len(records) > 0
++        except Exception as exc:  # noqa: BLE001 - fall back to walking the tree
++            print(f"  record_list.csv present but unreadable ({exc}); walking tree instead")
++
++    if not used_csv:
++        for mat in meeti_dir.rglob("*.mat"):
++            ecg_id = _study_id_from_stem(mat.stem)
++            if ecg_id is None:
++                continue
++            png = mat.with_suffix(".png")
++            records.append(
++                {"ecg_id": ecg_id, "subject_id": _subject_from_path(mat),
++                 "mat": mat, "png": png if png.exists() else None}
++            )
++
++    # De-duplicate on ecg_id (first occurrence wins).
++    seen, unique = set(), []
++    for r in records:
++        if r["ecg_id"] in seen:
++            continue
++        seen.add(r["ecg_id"])
++        unique.append(r)
++    return unique
++
++
++def _first_existing(single: Optional[Path], candidates: List[Path]) -> Optional[Path]:
++    if single is not None and Path(single).exists():
++        return Path(single)
++    for c in candidates:
++        if Path(c).exists():
++            return Path(c)
++    return None
++
++
++# ---------------------------------------------------------------------------
++# Patient-disjoint fold assignment (deterministic, machine-independent)
++# ---------------------------------------------------------------------------
++def fold_for_subject(subject_id: str, n_folds: int = 10) -> int:
++    """Stable hash of subject_id -> fold in 1..n_folds (train 1-8, val 9, test 10)."""
++    h = hashlib.md5(str(subject_id).encode("utf-8")).hexdigest()
++    return (int(h, 16) % n_folds) + 1
++
++
++# ---------------------------------------------------------------------------
++# Image placement
++# ---------------------------------------------------------------------------
++def place_image(src_png: Optional[Path], ecg_id: int, mode: str,
++                render_from_wfdb: Optional[Path]) -> bool:
++    """Make WORK_DIR/images/<ecg_id>.png exist. Returns True on success."""
++    dst = Path(image_path_for(ecg_id))
++    if dst.exists():
++        return True
++
++    if src_png is not None and Path(src_png).exists():
++        if mode == "symlink":
++            try:
++                os.symlink(os.path.abspath(src_png), dst)
++                return True
++            except OSError:
++                pass  # fall through to copy (e.g. Windows without privilege)
++        shutil.copyfile(src_png, dst)
++        return True
++
++    if render_from_wfdb is not None:
++        # Optional: render in the identical PTB-XL style if you have the
++        # matching MIMIC-IV-ECG waveform for this study id.
++        from ecg_to_image import load_signal, render_to_file
++        matches = list(Path(render_from_wfdb).rglob(f"{ecg_id}.hea"))
++        if matches:
++            rec = str(matches[0].with_suffix(""))
++            signal, fields = load_signal("", rec)
++            fs = int(fields.get("fs", C.SAMPLING_RATE))
++            render_to_file(signal, fs, str(dst))
++            return True
++
++    return False
++
++
++# ---------------------------------------------------------------------------
++# Main
++# ---------------------------------------------------------------------------
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--meeti-dir", required=True,
++                    help="root of the extracted MEETI dataset (contains the pNNNN/ tree "
++                         "and, usually, record_list.csv)")
++    ap.add_argument("--limit", type=int, default=None,
++                    help="only process the first N discovered records (quick test)")
++    ap.add_argument("--label-mode", choices=["rule", "none"], default="rule",
++                    help="'rule' = weak-label reports into the 5 superclasses; "
++                         "'none' = leave labels empty (contrastive fine-tuning only)")
++    ap.add_argument("--caption-source", choices=["report", "llm", "report+llm"],
++                    default="report",
++                    help="which text goes into the `report` column that "
++                         "finetune_clip.py --caption report consumes")
++    ap.add_argument("--image-mode", choices=["copy", "symlink"], default="copy",
++                    help="how to place MEETI PNGs into WORK_DIR/images/")
++    ap.add_argument("--keep-unimaged", action="store_true",
++                    help="keep records that have no image in labels.csv. Off by "
++                         "default: MEETI ships images for only ~10k of its 784k "
++                         "records, and every script here is image-based, so "
++                         "imageless rows would crash evaluation.")
++    ap.add_argument("--render-from-wfdb", default=None,
++                    help="optional dir of MIMIC-IV-ECG WFDB records; render missing "
++                         "images in the identical PTB-XL style instead of using PNGs")
++    ap.add_argument("--n-folds", type=int, default=10)
++    args = ap.parse_args()
++
++    meeti_dir = Path(args.meeti_dir).expanduser()
++    if not meeti_dir.exists():
++        raise SystemExit(f"MEETI dir not found: {meeti_dir}")
++
++    print(f"Scanning {meeti_dir} ...")
++    records = discover_records(meeti_dir)
++    if args.limit:
++        records = records[: args.limit]
++    if not records:
++        raise SystemExit("No MEETI records discovered. Check --meeti-dir points at "
++                         "the folder containing the pNNNN/ subject tree.")
++    print(f"Discovered {len(records)} records")
++
++    render_dir = Path(args.render_from_wfdb).expanduser() if args.render_from_wfdb else None
++
++    rows = []
++    n_images, n_missing_img, label_counts = 0, 0, {c: 0 for c in C.CLASSES}
++    n_unlabeled = 0
++
++    for rec in tqdm(records, desc="Preparing MEETI"):
++        fields = read_mat_fields(rec["mat"])
++        report = fields.get("report", "")
++        llm = fields.get("LLM_Interpretation", "")
++
++        if args.caption_source == "llm":
++            caption_text = llm or report
++        elif args.caption_source == "report+llm":
++            caption_text = (report + " " + llm).strip()
++        else:
++            caption_text = report
++
++        ok = place_image(rec["png"], rec["ecg_id"], args.image_mode, render_dir)
++        n_images += int(ok)
++        n_missing_img += int(not ok)
++
++        # Every downstream script opens the image, so an imageless record is
++        # unusable here -> drop it unless the user explicitly opts in. MEETI
++        # ships images for only ~10k of its 784k records.
++        if not ok and not args.keep_unimaged:
++            continue
++
++        if args.label_mode == "rule":
++            supers = map_report_to_superclasses(report or llm)
++        else:
++            supers = []
++        if not supers:
++            n_unlabeled += 1
++        for c in supers:
++            label_counts[c] += 1
++
++        row = {
++            "ecg_id": rec["ecg_id"],
++            "subject_id": rec["subject_id"],
++            "strat_fold": fold_for_subject(rec["subject_id"], args.n_folds),
++            "report": caption_text,
++            "report_raw": report,
++            "llm_interpretation": llm,
++            "superclasses": "|".join(supers),
++            "has_image": int(ok),
++        }
++        for c in C.CLASSES:
++            row[c] = 1.0 if c in supers else 0.0
++        rows.append(row)
++
++    df = pd.DataFrame(rows).set_index("ecg_id")
++
++    # Order columns to mirror PTB-XL's labels.csv (index first, then meta, classes).
++    ordered = ["subject_id", "strat_fold", "report", "report_raw",
++               "llm_interpretation", "superclasses", "has_image"] + list(C.CLASSES)
++    df = df[ordered]
++
++    out = os.path.join(C.WORK_DIR, "labels.csv")
++    df.to_csv(out)
++
++    # ---- report ----
++    train = df.strat_fold.isin(C.TRAIN_FOLDS).sum()
++    val = (df.strat_fold == C.VAL_FOLD).sum()
++    test = (df.strat_fold == C.TEST_FOLD).sum()
++    print(f"\nSaved labels -> {out}")
++    print(f"Rows written: {len(df)} | train {train} val {val} test {test} "
++          f"(patient-disjoint by subject_id)")
++    print(f"Images placed: {n_images} | records with no image: {n_missing_img}")
++    if args.label_mode == "rule":
++        for c in C.CLASSES:
++            print(f"  {c:5s}: {label_counts[c]} positive")
++        print(f"  (no superclass matched: {n_unlabeled} records)")
++        print("\nNOTE: these labels are WEAK (regex over free-text reports), not "
++              "curated ground truth. See meeti_labeling.py to inspect/adjust rules.")
++    else:
++        print("Label mode 'none': class columns are all zero. Use MEETI for "
++              "contrastive fine-tuning (finetune_clip.py --caption report).")
++    if n_missing_img:
++        if args.keep_unimaged:
++            print(f"\nWARNING: {n_missing_img} rows have no image and WILL CRASH "
++                  "evaluation (--keep-unimaged was set). Remove them before running "
++                  "zero_shot_eval.py / extract_features.py / finetune_clip.py.")
++        else:
++            print(f"\nNote: {n_missing_img} records had no image and were dropped "
++                  "(MEETI ships images for only ~10k records). Pass --render-from-wfdb "
++                  "to render more from MIMIC-IV-ECG waveforms, or --keep-unimaged to keep them.")
++
++
++if __name__ == "__main__":
++    main()
